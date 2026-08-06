@@ -3,7 +3,8 @@ import { create, useModal } from '@ebay/nice-modal-react';
 import { useTranslation } from 'react-i18next';
 import { GitBranchIcon, PlusIcon } from '@phosphor-icons/react';
 import { defineModal } from '@/shared/lib/modals';
-import { ApiError, workspacesApi } from '@/shared/lib/api';
+import { workspacesApi } from '@/shared/lib/api';
+import { getLinkWorkspaceErrorMessage } from '@/shared/lib/workspaces';
 import { getWorkspaceDefaults } from '@/shared/lib/workspaceDefaults';
 import { ErrorDialog } from '@vibe/ui/components/ErrorDialog';
 import { useProjectWorkspaceCreateDraft } from '@/shared/hooks/useProjectWorkspaceCreateDraft';
@@ -25,8 +26,8 @@ import {
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { ProjectProvider } from '@/shared/providers/remote/ProjectProvider';
 import { useProjectContext } from '@/shared/hooks/useProjectContext';
-import { UserProvider } from '@/shared/providers/remote/UserProvider';
-import { useUserContext } from '@/shared/hooks/useUserContext';
+import { WorkspacesProvider } from '@/shared/providers/remote/WorkspacesProvider';
+import { useWorkspacesContext } from '@/shared/hooks/useWorkspacesContext';
 
 export interface WorkspaceSelectionDialogProps {
   projectId: string;
@@ -34,25 +35,6 @@ export interface WorkspaceSelectionDialogProps {
 }
 
 const PAGE_SIZE = 50;
-
-function getLinkWorkspaceErrorMessage(error: unknown): string | null {
-  if (error instanceof ApiError && error.status === 409) {
-    return 'This workspace is already linked to an issue.';
-  }
-
-  if (error instanceof Error) {
-    const normalizedMessage = error.message.toLowerCase();
-    if (
-      normalizedMessage.includes('already exists') ||
-      normalizedMessage.includes('already linked')
-    ) {
-      return 'This workspace is already linked to an issue.';
-    }
-    return error.message;
-  }
-
-  return null;
-}
 
 /** Inner component that uses contexts to render the selection UI */
 function WorkspaceSelectionContent({
@@ -70,8 +52,8 @@ function WorkspaceSelectionContent({
   // Get local workspaces from WorkspaceContext (both active and archived)
   const { activeWorkspaces, archivedWorkspaces } = useWorkspaceContext();
 
-  // Get already-linked workspaces from UserContext (workspaces are user-scoped)
-  const { getWorkspacesForIssue, workspaces } = useUserContext();
+  // Get already-linked workspaces from WorkspacesContext (the global workspace list)
+  const { getWorkspacesForIssue, workspaces } = useWorkspacesContext();
 
   // Get issue data from ProjectContext (issues are project-scoped)
   const { getIssue } = useProjectContext();
@@ -320,7 +302,7 @@ function WorkspaceSelectionContent({
   );
 }
 
-/** Wrapper that provides UserContext and ProjectContext */
+/** Wrapper that provides WorkspacesContext and ProjectContext */
 function WorkspaceSelectionWithContext({
   projectId,
   issueId,
@@ -330,11 +312,11 @@ function WorkspaceSelectionWithContext({
   }
 
   return (
-    <UserProvider>
+    <WorkspacesProvider>
       <ProjectProvider projectId={projectId}>
         <WorkspaceSelectionContent projectId={projectId} issueId={issueId} />
       </ProjectProvider>
-    </UserProvider>
+    </WorkspacesProvider>
   );
 }
 

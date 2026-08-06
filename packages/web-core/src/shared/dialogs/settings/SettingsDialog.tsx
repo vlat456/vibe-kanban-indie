@@ -57,9 +57,6 @@ function SettingsDialogNavigation({
   const hostSections = SETTINGS_SECTION_DEFINITIONS.filter(
     (section) => section.group === 'host'
   );
-  const universalSections = SETTINGS_SECTION_DEFINITIONS.filter(
-    (section) => section.group === 'universal'
-  );
   const hostOptions = availableHosts.map((host) => ({
     value: host.id,
     label: host.status != null ? `${host.label} (${host.status})` : host.label,
@@ -108,7 +105,7 @@ function SettingsDialogNavigation({
     <nav className="flex-1 p-2 flex flex-col gap-4 overflow-y-auto">
       <div className="space-y-2">
         <div className="px-3 pt-1">
-          <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-low">
+          <div className="text-2xs font-semibold uppercase tracking-[0.08em] text-low">
             {t('settings.layout.nav.machineSettings')}
           </div>
         </div>
@@ -125,16 +122,6 @@ function SettingsDialogNavigation({
         </div>
         <div className="flex flex-col gap-1">
           {hostSections.map((section) => renderSectionButton(section.id))}
-        </div>
-      </div>
-      <div className="space-y-2">
-        <div className="px-3 pt-1">
-          <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-low">
-            {t('settings.layout.nav.accountSettings')}
-          </div>
-        </div>
-        <div className="flex flex-col gap-1">
-          {universalSections.map((section) => renderSectionButton(section.id))}
         </div>
       </div>
     </nav>
@@ -160,12 +147,10 @@ function SettingsDialogContent({
       return initialSection;
     }
 
-    if (hostsResolved && availableHosts.length === 0) {
-      return 'organizations';
-    }
-
+    // ADR-018 — the deleted `organizations` section is gone; default to
+    // `general` when no host is available.
     return 'general';
-  }, [availableHosts.length, hostsResolved, initialSection]);
+  }, [initialSection]);
 
   const [activeSection, setActiveSection] = useState<SettingsSectionType>(
     resolvedInitialSection
@@ -211,7 +196,8 @@ function SettingsDialogContent({
       isHostSpecificSettingsSection(activeSection) &&
       availableHosts.length === 0
     ) {
-      setActiveSection('organizations');
+      // ADR-018 — `organizations` section is gone; fall back to `general`.
+      setActiveSection('general');
     }
   }, [activeSection, availableHosts.length, hostsResolved]);
 

@@ -37,7 +37,6 @@ import {
   QuestionIcon,
   ArrowsLeftRightIcon,
   ArrowFatLineUpIcon,
-  UsersIcon,
   TreeStructureIcon,
   LinkIcon,
   ArrowBendUpRightIcon,
@@ -153,18 +152,15 @@ function getNextWorkspaceId(
   return null;
 }
 
-// Helper to navigate to create-issue form for a sub-issue, carrying over parent assignees
+// Helper to open the create-issue modal for a sub-issue. The modal opens the
+// bridge component handles navigation after the issue is created.
 function navigateToCreateSubIssue(
   ctx: ActionExecutorContext,
   parentIssueId: string
 ) {
-  const assigneeIds = ctx.projectMutations
-    ?.getAssigneesForIssue(parentIssueId)
-    .map((a) => a.user_id);
-  ctx.navigateToCreateIssue({
+  void ctx.createIssue({
     statusId: ctx.defaultCreateStatusId,
     parentIssueId,
-    assigneeIds: assigneeIds?.length ? assigneeIds : undefined,
   });
 }
 
@@ -438,14 +434,12 @@ export const Actions = {
     icon: GearIcon,
     requiresTarget: ActionTargetType.NONE,
     isVisible: (ctx) => ctx.layoutMode === 'kanban',
-    execute: async (ctx) => {
-      await SettingsDialog.show({
-        initialSection: 'remote-projects',
-        initialState: {
-          organizationId: ctx.kanbanOrgId,
-          projectId: ctx.kanbanProjectId,
-        },
-      });
+    execute: async () => {
+      // ADR-018 — the `remote-projects` settings section is gone (deleted
+      // along with `OrganizationsSettingsSection`). Projects have no
+      // dedicated settings surface anymore; open the global settings
+      // dialog as a fallback.
+      await SettingsDialog.show();
     },
   } satisfies GlobalActionDefinition,
 
@@ -1194,7 +1188,7 @@ export const Actions = {
     requiresTarget: ActionTargetType.NONE,
     isVisible: (ctx) => ctx.layoutMode === 'kanban' && !ctx.isCreatingIssue,
     execute: (ctx) => {
-      ctx.navigateToCreateIssue({ statusId: ctx.defaultCreateStatusId });
+      void ctx.createIssue({ statusId: ctx.defaultCreateStatusId });
     },
   } satisfies GlobalActionDefinition,
 
@@ -1259,33 +1253,6 @@ export const Actions = {
         projectId: ctx.kanbanProjectId,
         selection: { type: 'priority', issueIds: [], isCreateMode: true },
       });
-    },
-  } satisfies GlobalActionDefinition,
-
-  ChangeAssignees: {
-    id: 'change-assignees',
-    label: 'Change Assignees',
-    icon: UsersIcon,
-    shortcut: 'I A',
-    requiresTarget: ActionTargetType.ISSUE,
-    isVisible: (ctx) =>
-      ctx.layoutMode === 'kanban' && ctx.hasSelectedKanbanIssue,
-    execute: async (ctx, projectId, issueIds) => {
-      await ctx.openAssigneeSelection(projectId, issueIds, false);
-    },
-  } satisfies IssueActionDefinition,
-
-  ChangeNewIssueAssignees: {
-    id: 'change-new-issue-assignees',
-    label: 'Change Assignees',
-    icon: UsersIcon,
-    shortcut: 'I A',
-    requiresTarget: ActionTargetType.NONE,
-    isVisible: (ctx) => ctx.layoutMode === 'kanban' && ctx.isCreatingIssue,
-    execute: async (ctx) => {
-      // Opens assignee selection for the issue being created
-      // ProjectId will be resolved from route params inside the dialog
-      await ctx.openAssigneeSelection('', [], true);
     },
   } satisfies GlobalActionDefinition,
 

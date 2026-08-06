@@ -8,10 +8,9 @@ import {
 } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useProjectContext } from '@/shared/hooks/useProjectContext';
-import { useOrgContext } from '@/shared/hooks/useOrgContext';
+import { useProjects } from '@/shared/hooks/useProjects';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
 import { useActions } from '@/shared/hooks/useActions';
-import { useAuth } from '@/shared/hooks/auth/useAuth';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import { cn } from '@/shared/lib/utils';
@@ -19,7 +18,6 @@ import { useCurrentKanbanRouteState } from '@/shared/hooks/useCurrentKanbanRoute
 import {
   useUiPreferencesStore,
   resolveKanbanProjectState,
-  KANBAN_ASSIGNEE_FILTER_VALUES,
   KANBAN_PROJECT_VIEW_IDS,
   type KanbanFilterState,
   type KanbanSortField,
@@ -28,20 +26,17 @@ import {
   useKanbanFilters,
   PRIORITY_ORDER,
 } from '../model/hooks/useKanbanFilters';
-import {
-  bulkUpdateIssues,
-  type BulkUpdateIssueItem,
-} from '@/shared/lib/remoteApi';
+import { type BulkUpdateIssueItem } from '@/shared/lib/remoteApi';
+import { persistIssues, persistIssueSwap } from '@/shared/lib/persistIssues';
 import { PlusIcon, DotsThreeIcon } from '@phosphor-icons/react';
 import { Actions } from '@/shared/actions';
 import {
   buildKanbanIssueComposerKey,
   closeKanbanIssueComposer,
-  openKanbanIssueComposer,
   type ProjectIssueCreateOptions,
   useKanbanIssueComposer,
 } from '@/shared/stores/useKanbanIssueComposerStore';
-import type { OrganizationMemberWithProfile } from 'shared/types';
+// ADR-019: User entity excised — no UserWithProfile import needed.
 import {
   KanbanProvider,
   KanbanBoard,
@@ -50,6 +45,7 @@ import {
   KanbanHeader,
   type DropResult,
 } from '@vibe/ui/components/KanbanBoard';
+import { DragDropContext } from '@hello-pangea/dnd';
 import { KanbanCardContent } from '@vibe/ui/components/KanbanCardContent';
 import { KanbanWorkspaceDispatch } from '@vibe/ui/components/KanbanWorkspaceDispatch';
 import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
@@ -79,6 +75,16 @@ import { refreshShapeSource } from '@/shared/lib/electric/collections';
 import { useIssueMultiSelect } from '@/shared/hooks/useIssueMultiSelect';
 import { useIssueSelectionStore } from '@/shared/stores/useIssueSelectionStore';
 import { BulkActionBarContainer } from './BulkActionBarContainer';
+import { computeKanbanMove } from '../model/computeKanbanMove';
+import { buildKanbanMoveUpdates } from '../model/buildKanbanMoveUpdates';
+import { createSyncGuard } from '../model/syncGuard';
+import { buildProjectBreadcrumb } from '../model/buildProjectBreadcrumb';
+import type { BreadcrumbEntry } from '../model/buildProjectBreadcrumb';
+import {
+  useKanbanDragHandler,
+  type KanbanDragHandler,
+  type KanbanMove,
+} from '@/shared/components/ui-new/containers/KanbanDragHandlerContext';
 
 const areStringSetsEqual = (left: string[], right: string[]): boolean => {
   if (left.length !== right.length) {
@@ -98,10 +104,6 @@ const areKanbanFiltersEqual = (
   }
 
   if (!areStringSetsEqual(left.priorities, right.priorities)) {
-    return false;
-  }
-
-  if (!areStringSetsEqual(left.assigneeIds, right.assigneeIds)) {
     return false;
   }
 
@@ -125,8 +127,55 @@ function LoadingState() {
 }
 
 /**
- * KanbanContainer displays the kanban board using data from ProjectContext and OrgContext.
- * Must be rendered within both OrgProvider and ProjectProvider.
+ * Renders the project breadcrumb inside the kanban header. Extracted from
+ * the prior inline IIFE in `KanbanContainer` so the JSX stays linear and
+ * the render logic is unit-addressable. Last segment is plain text;
+ * earlier segments are buttons that call `onNavigateProject(id)`; segments
+ * are separated by `/`. When `entries` is empty, `fallback` is shown
+ * instead (the single-project / data-not-yet-loaded case).
+ */
+function ProjectBreadcrumb({
+  entries,
+  fallback,
+  onNavigateProject,
+}: {
+  entries: readonly BreadcrumbEntry[];
+  fallback: string;
+  onNavigateProject: (id: string) => void;
+}) {
+  if (entries.length === 0) {
+    return <>{fallback}</>;
+  }
+  return (
+    <>
+      {entries.map((entry, index) => {
+        const isLast = index === entries.length - 1;
+        return (
+          <span key={entry.id} className="inline-flex items-center">
+            {index > 0 && <span className="px-half text-low">/</span>}
+            {isLast ? (
+              <span className="truncate">{entry.name}</span>
+            ) : (
+              <button
+                type="button"
+                className="text-low hover:text-normal truncate cursor-pointer"
+                onClick={() => onNavigateProject(entry.id)}
+              >
+                {entry.name}
+              </button>
+            )}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * KanbanContainer displays the kanban board using data from ProjectContext
+ * (per-project issues/statuses/tags) plus the flat ProjectProvider
+ * (project list). Must be rendered within both ProjectProvider layers
+ * — the per-project one (issues) AND the flat one (project list).
  */
 export function KanbanContainer() {
   const isMobile = useIsMobile();
@@ -140,7 +189,6 @@ export function KanbanContainer() {
     issues,
     statuses,
     tags,
-    issueAssignees,
     issueTags,
     issueRelationships,
     getTagObjectsForIssue,
@@ -156,13 +204,9 @@ export function KanbanContainer() {
     isLoading: projectLoading,
   } = useProjectContext();
 
-  const {
-    projects,
-    membersWithProfilesById,
-    isLoading: orgLoading,
-  } = useOrgContext();
+  // Flat projects layer.
+  const { data: projects } = useProjects();
   const { activeWorkspaces } = useWorkspaceContext();
-  const { userId } = useAuth();
 
   // Get project name by finding the project matching current projectId
   const projectName = projects.find((p) => p.id === projectId)?.name ?? '';
@@ -194,20 +238,19 @@ export function KanbanContainer() {
     },
     [appNavigation, projectId]
   );
-  const startCreate = useCallback(
-    (options?: ProjectIssueCreateOptions) => {
-      openKanbanIssueComposer(issueComposerKey, options);
-    },
-    [issueComposerKey]
-  );
-
   // Get setter and executor from ActionsContext
   const {
     setDefaultCreateStatusId,
     executeAction,
     openPrioritySelection,
-    openAssigneeSelection,
+    createIssue,
   } = useActions();
+  const startCreate = useCallback(
+    (options?: ProjectIssueCreateOptions) => {
+      void createIssue(options);
+    },
+    [createIssue]
+  );
   const openProjectsGuide = useCallback(() => {
     executeAction(Actions.ProjectsGuide);
   }, [executeAction]);
@@ -293,7 +336,6 @@ export function KanbanContainer() {
 
   const { filteredIssues } = useKanbanFilters({
     issues,
-    issueAssignees,
     issueTags,
     issueRelationships,
     issuesById,
@@ -301,7 +343,6 @@ export function KanbanContainer() {
     filters: kanbanFilters,
     showSubIssues,
     hideBlocked,
-    currentUserId: userId,
   });
 
   const setKanbanSearchQuery = useCallback(
@@ -319,16 +360,6 @@ export function KanbanContainer() {
       setKanbanProjectViewFilters(projectId, activeViewId, {
         ...kanbanFilters,
         priorities,
-      });
-    },
-    [activeViewId, kanbanFilters, projectId, setKanbanProjectViewFilters]
-  );
-
-  const setKanbanAssignees = useCallback(
-    (assigneeIds: string[]) => {
-      setKanbanProjectViewFilters(projectId, activeViewId, {
-        ...kanbanFilters,
-        assigneeIds,
       });
     },
     [activeViewId, kanbanFilters, projectId, setKanbanProjectViewFilters]
@@ -398,7 +429,12 @@ export function KanbanContainer() {
   const prevProjectIdRef = useRef<string | null>(null);
 
   // Track when drag-drop sync is in progress to prevent flicker
-  const isSyncingRef = useRef(false);
+  const isSyncingCountRef = useRef(0);
+
+  // Single source of truth for `sortField === 'sort_order'`. Used by the
+  // swap branch gate, the move branch gate (P4-B1), and the
+  // `positionalReorderEnabled` prop. Plain string compare — no memo.
+  const isManualSort = kanbanFilters.sortField === 'sort_order';
 
   useEffect(() => {
     if (
@@ -453,27 +489,6 @@ export function KanbanContainer() {
     setDefaultCreateStatusId(defaultCreateStatusId);
   }, [defaultCreateStatusId, setDefaultCreateStatusId]);
 
-  const createAssigneeIds = useMemo(() => {
-    const assigneeIds = new Set<string>();
-
-    for (const assigneeId of kanbanFilters.assigneeIds) {
-      if (assigneeId === KANBAN_ASSIGNEE_FILTER_VALUES.UNASSIGNED) {
-        continue;
-      }
-
-      if (assigneeId === KANBAN_ASSIGNEE_FILTER_VALUES.SELF) {
-        if (userId) {
-          assigneeIds.add(userId);
-        }
-        continue;
-      }
-
-      assigneeIds.add(assigneeId);
-    }
-
-    return [...assigneeIds];
-  }, [kanbanFilters.assigneeIds, userId]);
-
   // Get statuses to display in list view (all or filtered to one)
   const listViewStatuses = useMemo(() => {
     if (listViewStatusFilter) {
@@ -484,12 +499,17 @@ export function KanbanContainer() {
 
   // Track items as arrays of IDs grouped by status
   const [items, setItems] = useState<Record<string, string[]>>({});
+  // Items mirror, used by the move handler to compute the next state
+  // outside the React updater (the previous implementation mutated a `let`
+  // inside the setItems updater, which is fragile under concurrent React).
+  const itemsRef = useRef<Record<string, string[]>>({});
+  itemsRef.current = items;
   const [isFiltersDialogOpen, setIsFiltersDialogOpen] = useState(false);
 
   // Sync items from filtered issues when they change
   useEffect(() => {
     // Skip rebuild during drag-drop sync to prevent flicker
-    if (isSyncingRef.current) {
+    if (isSyncingCountRef.current > 0) {
       return;
     }
 
@@ -536,7 +556,8 @@ export function KanbanContainer() {
     setItems(grouped);
   }, [filteredIssues, statuses, kanbanFilters]);
 
-  // Create a lookup map for issue data
+  // Full-Issue Record intentionally stays local: rendering needs fields beyond
+  // the shared drag lookup projection.
   const issueMap = useMemo(() => {
     const map: Record<string, (typeof issues)[0]> = {};
     for (const issue of issues) {
@@ -544,26 +565,6 @@ export function KanbanContainer() {
     }
     return map;
   }, [issues]);
-
-  // Create a lookup map for issue assignees (issue_id -> OrganizationMemberWithProfile[])
-  const issueAssigneesMap = useMemo(() => {
-    const map: Record<string, OrganizationMemberWithProfile[]> = {};
-    for (const assignee of issueAssignees) {
-      const member = membersWithProfilesById.get(assignee.user_id);
-      if (member) {
-        if (!map[assignee.issue_id]) {
-          map[assignee.issue_id] = [];
-        }
-        map[assignee.issue_id].push(member);
-      }
-    }
-    return map;
-  }, [issueAssignees, membersWithProfilesById]);
-
-  const membersWithProfiles = useMemo(
-    () => [...membersWithProfilesById.values()],
-    [membersWithProfilesById]
-  );
 
   const localWorkspacesById = useMemo(() => {
     const map = new Map<string, (typeof activeWorkspaces)[number]>();
@@ -666,9 +667,8 @@ export function KanbanContainer() {
             linesAdded: workspace.lines_added ?? 0,
             linesRemoved: workspace.lines_removed ?? 0,
             prs: prsByWorkspaceId.get(workspace.id) ?? [],
-            owner: membersWithProfilesById.get(workspace.owner_user_id) ?? null,
+            owner: null,
             updatedAt: workspace.updated_at,
-            isOwnedByCurrentUser: workspace.owner_user_id === userId,
             isRunning: localWorkspace?.isRunning,
             hasPendingApproval: localWorkspace?.hasPendingApproval,
             hasRunningDevServer: localWorkspace?.hasRunningDevServer,
@@ -690,8 +690,6 @@ export function KanbanContainer() {
     getWorkspacesForIssue,
     localWorkspacesById,
     prsByWorkspaceId,
-    membersWithProfilesById,
-    userId,
   ]);
 
   // Calculate sort_order based on column index and issue position
@@ -704,100 +702,192 @@ export function KanbanContainer() {
     [statusColumnIndexMap]
   );
 
-  // Simple onDragEnd handler - the library handles all visual movement
-  const handleDragEnd = useCallback(
+  // Fire the REST + shape refresh. `isSyncingCountRef` gates the items-rebuild
+  // effect so the optimistic local order isn't trampled by a slow shape
+  // sync; decremented in both branches once the shape refresh resolves (or
+  // the catch runs). On failure we just log + force a shape refresh — the
+  // failed bulkUpdateIssues left the backend untouched, so the next shape
+  // sync restores authoritative state.
+  //
+  // P4-BUG1: a 10s safety net decrements the counter if `onSettled` never
+  // fires (network drop, suspended tab). Without it the counter would stay
+  // >0 forever and the items-rebuild effect would freeze the board.
+  const applyKanbanMove = useCallback(
+    (updates: BulkUpdateIssueItem[], projectIdArg: string) => {
+      isSyncingCountRef.current += 1;
+      const guard = createSyncGuard({
+        decrement: () => {
+          isSyncingCountRef.current -= 1;
+        },
+      });
+      persistIssues(updates, projectIdArg, {
+        onError: (err) =>
+          console.error('Failed to bulk update sort order:', err),
+        onSettled: guard.bind(() => {
+          isSyncingCountRef.current -= 1;
+        }),
+      });
+    },
+    []
+  );
+
+  // Move-based handler. Called from two paths:
+  //   1. The shared custom drag system via KanbanDragHandlerProvider.
+  //      Cross-surface drops land here when the drop target resolves
+  //      to a bare-UUID kanban column (column move → append).
+  //   2. The legacy list-view adapter (IssueListView) which still uses
+  //      hello-pangea for positional reordering inside columns.
+  // Thin orchestrator: guard → compute next state → build updates →
+  // apply (REST + shape refresh).
+  const handleKanbanMove = useCallback(
+    (move: KanbanMove) => {
+      const { swapWithIssueId } = move;
+      // Same-column SWAP of two cards: exchange their status_id +
+      // sort_order optimistically (no round-trip flash — the visual
+      // preview already reordered the DOM, so committing immediately in
+      // the local items map prevents the "updated → old → correct" flicker
+      // the user saw on successful swaps).
+      // Only same-status swaps are reachable: the drag controller filters
+      // card candidates by `data-drop-target-status === source.statusId`,
+      // so a and b necessarily share the same column. The cross-status
+      // branch below is defensive against a future controller change.
+      if (swapWithIssueId) {
+        // P4-D2: gate the swap on the single `isManualSort` const. Under
+        // priority/created_at/title sort, swapping two cards touches only
+        // sort_order — the active sort field would re-derive order on the
+        // next shape sync, so the swap is a no-op for the user.
+        if (!isManualSort) return;
+        const a = issueMap[move.issueId];
+        const b = issueMap[swapWithIssueId];
+        if (!a || !b) return;
+        if (move.swapWithIssueId === move.issueId) return;
+        // Defensive: a cross-status swap is not implementable here (we
+        // would need to rewrite both `status_id` and the new column's
+        // neighbouring sort_orders). The controller never produces one,
+        // so just bail.
+        if (a.status_id !== b.status_id) return;
+        setItems((prev) => {
+          const next = { ...prev };
+          const aCol = [...(next[a.status_id] ?? [])];
+          const ai = aCol.indexOf(a.id);
+          const bi = aCol.indexOf(b.id);
+          if (ai !== -1 && bi !== -1) {
+            [aCol[ai], aCol[bi]] = [aCol[bi], aCol[ai]];
+            next[a.status_id] = aCol;
+          }
+          return next;
+        });
+        isSyncingCountRef.current += 1;
+        // P4-BUG1: same 10s safety net as the move branch — a swap
+        // whose `bulkUpdateIssues` never settles must NOT freeze the
+        // items-rebuild gate.
+        const guard = createSyncGuard({
+          decrement: () => {
+            isSyncingCountRef.current -= 1;
+          },
+        });
+        persistIssueSwap(a, b, projectId, {
+          onError: (err) => console.error('[dnd] kanban swap failed:', err),
+          onSettled: guard.bind(() => {
+            isSyncingCountRef.current -= 1;
+          }),
+        });
+        return;
+      }
+
+      const { fromStatusId: from, toStatusId: to } = move;
+      // Same-status drop is a no-op when EITHER:
+      //   (a) no explicit insertion index is supplied — the custom DnD
+      //       controller never produces a same-status column target (it
+      //       filters cards by `data-drop-target-status === source.statusId`),
+      //       so the only same-status-with-index path is the legacy
+      //       list-view adapter — a positional reorder inside the same
+      //       column.
+      //   (b) the sort field is non-positional (priority/created_at/
+      //       title). Under non-manual sort a same-status list-view
+      //       reorder (explicit index) would otherwise fire a useless
+      //       `{status_id: to}` write (to === from) and hold the
+      //       items-rebuild gate open for 10s. The legacy adapter only
+      //       emits an explicit index when its `onDragEnd` ran; bail
+      //       here so the commit short-circuits before the gate holds
+      //       and the backend round-trips a no-op (P5-E1).
+      if (from === to && (move.index === undefined || !isManualSort)) return;
+
+      // P4-B1: under non-manual sort, the column is ordered by a
+      // non-positional field (priority/created_at/title). The custom
+      // drop controller's resolved slot is OPTIMISTIC — the next shape
+      // sync re-derives order from the active sort. Drop the index so
+      // `computeKanbanMove` appends, and ask `buildKanbanMoveUpdates`
+      // for a status-only update (no sort_order rewrite).
+      const effectiveMove = isManualSort ? move : { ...move, index: undefined };
+
+      const newItems = computeKanbanMove(itemsRef.current, effectiveMove);
+      setItems(newItems);
+
+      const updates = buildKanbanMoveUpdates({
+        newItems,
+        move,
+        isManualSort,
+        calculateSortOrder,
+        statusColumnIndexMap,
+      });
+
+      applyKanbanMove(updates, projectId);
+    },
+    [
+      projectId,
+      calculateSortOrder,
+      statusColumnIndexMap,
+      applyKanbanMove,
+      issueMap,
+      isManualSort,
+    ]
+  );
+
+  // Legacy list-view adapter (positional reorder still uses
+  // hello-pangea). Translates the DropResult into a KanbanMove.
+  const handleLegacyListDragEnd = useCallback(
     (result: DropResult) => {
-      const { source, destination } = result;
-
-      // Dropped outside a valid droppable
-      if (!destination) return;
-
-      // No movement
+      if (!result.destination) return;
+      const fromStatusId = result.source.droppableId;
+      const toStatusId = result.destination.droppableId;
       if (
-        source.droppableId === destination.droppableId &&
-        source.index === destination.index
+        fromStatusId === toStatusId &&
+        result.source.index === result.destination.index
       ) {
         return;
       }
-
-      const isManualSort = kanbanFilters.sortField === 'sort_order';
-
-      // Block within-column reordering when not in manual sort mode
-      // (cross-column moves are always allowed for status changes)
-      if (source.droppableId === destination.droppableId && !isManualSort) {
-        return;
-      }
-
-      const sourceId = source.droppableId;
-      const destId = destination.droppableId;
-      const isCrossColumn = sourceId !== destId;
-
-      // Update local state and capture new items for bulk update
-      let newItems: Record<string, string[]> = {};
-      setItems((prev) => {
-        const sourceItems = [...(prev[sourceId] ?? [])];
-        const [moved] = sourceItems.splice(source.index, 1);
-
-        if (!isCrossColumn) {
-          // Within-column reorder
-          sourceItems.splice(destination.index, 0, moved);
-          newItems = { ...prev, [sourceId]: sourceItems };
-        } else {
-          // Cross-column move
-          const destItems = [...(prev[destId] ?? [])];
-          destItems.splice(destination.index, 0, moved);
-          newItems = {
-            ...prev,
-            [sourceId]: sourceItems,
-            [destId]: destItems,
-          };
-        }
-        return newItems;
+      handleKanbanMove({
+        issueId: result.draggableId,
+        fromStatusId,
+        toStatusId,
+        index: result.destination.index,
       });
-
-      // Build bulk updates for all issues in affected columns
-      const updates: BulkUpdateIssueItem[] = [];
-
-      // Always update destination column
-      const destIssueIds = newItems[destId] ?? [];
-      destIssueIds.forEach((issueId, index) => {
-        updates.push({
-          id: issueId,
-          changes: {
-            status_id: destId,
-            sort_order: calculateSortOrder(destId, index),
-          },
-        });
-      });
-
-      // Update source column if cross-column move
-      if (isCrossColumn) {
-        const sourceIssueIds = newItems[sourceId] ?? [];
-        sourceIssueIds.forEach((issueId, index) => {
-          updates.push({
-            id: issueId,
-            changes: {
-              sort_order: calculateSortOrder(sourceId, index),
-            },
-          });
-        });
-      }
-
-      // Perform bulk update
-      isSyncingRef.current = true;
-      bulkUpdateIssues(updates)
-        .catch((err) => {
-          console.error('Failed to bulk update sort order:', err);
-        })
-        .finally(() => {
-          // Delay clearing flag to let Electric sync complete
-          setTimeout(() => {
-            isSyncingRef.current = false;
-          }, 500);
-        });
     },
-    [kanbanFilters.sortField, calculateSortOrder]
+    [handleKanbanMove]
   );
+
+  // Register the move-based handler with the SharedAppLayout bridge so the
+  // shared DragProvider can delegate kanban-internal drops back here.
+  //
+  // The handler is registered ONCE on mount and reads the latest
+  // `handleKanbanMove` through a ref. This is deliberate: handler identity
+  // churns whenever `statuses` refetches via the ~30s fallback poll
+  // (the chained `useMemo`s — `sortedStatuses` → `visibleStatuses` →
+  // `statusColumnIndexMap` → `calculateSortOrder` — produce fresh
+  // identities even for content-equal data), and re-registering on every
+  // churn means the bridge cleanup nulls `kanbanHandlerRef.current` and
+  // the next run sets it back. The ref pattern keeps the bridge handler
+  // stable for the component's lifetime and always invokes the
+  // freshest closure.
+  const handleKanbanMoveRef = useRef(handleKanbanMove);
+  handleKanbanMoveRef.current = handleKanbanMove;
+  const { registerHandler: registerKanbanHandler } = useKanbanDragHandler();
+  useEffect(() => {
+    const stableHandler: KanbanDragHandler = (move) =>
+      handleKanbanMoveRef.current(move);
+    return registerKanbanHandler(stableHandler);
+  }, [registerKanbanHandler]);
 
   // Multi-select support
   const {
@@ -863,13 +953,10 @@ export function KanbanContainer() {
     (statusId?: string) => {
       const createPayload = {
         statusId: statusId ?? defaultCreateStatusId,
-        ...(createAssigneeIds.length > 0
-          ? { assigneeIds: createAssigneeIds }
-          : {}),
       };
       startCreate(createPayload);
     },
-    [createAssigneeIds, defaultCreateStatusId, startCreate]
+    [defaultCreateStatusId, startCreate]
   );
 
   // Inline editing callbacks for kanban cards
@@ -880,14 +967,6 @@ export function KanbanContainer() {
       openPrioritySelection(projectId, ids);
     },
     [projectId, openPrioritySelection, selectedIssueIds, isMultiSelectActive]
-  );
-
-  const handleCardAssigneeClick = useCallback(
-    (issueId: string) => {
-      const ids = isMultiSelectActive ? [...selectedIssueIds] : [issueId];
-      openAssigneeSelection(projectId, ids);
-    },
-    [projectId, openAssigneeSelection, selectedIssueIds, isMultiSelectActive]
   );
 
   const handleCardMoreActionsClick = useCallback(
@@ -937,7 +1016,12 @@ export function KanbanContainer() {
     [insertTag, projectId]
   );
 
-  const isLoading = projectLoading || orgLoading;
+  const isLoading = projectLoading;
+
+  const breadcrumb = useMemo(
+    () => buildProjectBreadcrumb(projects, projectId),
+    [projects, projectId]
+  );
 
   if (isLoading) {
     return <LoadingState />;
@@ -953,7 +1037,11 @@ export function KanbanContainer() {
       >
         <div className="flex items-center gap-half">
           <h2 className={cn('text-2xl font-medium', isMobile && 'text-lg')}>
-            {projectName}
+            <ProjectBreadcrumb
+              entries={breadcrumb}
+              fallback={projectName}
+              onNavigateProject={(id) => appNavigation.goToProject(id)}
+            />
           </h2>
 
           <DropdownMenu>
@@ -996,19 +1084,16 @@ export function KanbanContainer() {
             isFiltersDialogOpen={isFiltersDialogOpen}
             onFiltersDialogOpenChange={setIsFiltersDialogOpen}
             tags={tags}
-            users={membersWithProfiles}
             activeViewId={activeViewId}
             onViewChange={handleKanbanProjectViewChange}
             viewIds={KANBAN_PROJECT_VIEW_IDS}
             projectId={projectId}
-            currentUserId={userId}
             filters={kanbanFilters}
             showSubIssues={showSubIssues}
             showWorkspaces={showWorkspaces}
             hasActiveFilters={hasActiveFilters}
             onSearchQueryChange={setKanbanSearchQuery}
             onPrioritiesChange={setKanbanPriorities}
-            onAssigneesChange={setKanbanAssignees}
             onTagsChange={setKanbanTags}
             onSortChange={setKanbanSort}
             onShowSubIssuesChange={setShowSubIssues}
@@ -1031,7 +1116,7 @@ export function KanbanContainer() {
           </div>
         ) : (
           <div className="flex-1 overflow-x-auto px-double">
-            <KanbanProvider onDragEnd={handleDragEnd}>
+            <KanbanProvider>
               {visibleStatuses.map((status) => {
                 const issueIds = items[status.id] ?? [];
 
@@ -1056,8 +1141,13 @@ export function KanbanContainer() {
                         </button>
                       </div>
                     </KanbanHeader>
-                    <KanbanCards id={status.id}>
-                      {issueIds.map((issueId, index) => {
+                    <KanbanCards
+                      id={status.id}
+                      activeProjectId={projectId}
+                      issueIds={issueIds}
+                      positionalReorderEnabled={isManualSort}
+                    >
+                      {issueIds.map((issueId) => {
                         const issue = issueMap[issueId];
                         if (!issue) return null;
                         const issueWorkspaces =
@@ -1080,9 +1170,13 @@ export function KanbanContainer() {
                         return (
                           <KanbanCard
                             key={issue.id}
-                            id={issue.id}
+                            source={{
+                              kind: 'issue-move',
+                              issueId: issue.id,
+                              projectId,
+                              statusId: issue.status_id,
+                            }}
                             name={issue.title}
-                            index={index}
                             className="group"
                             onClick={(e) => handleCardClick(issue.id, e)}
                             isOpen={selectedKanbanIssueId === issue.id}
@@ -1096,7 +1190,6 @@ export function KanbanContainer() {
                               description={issue.description}
                               priority={issue.priority}
                               tags={getTagObjectsForIssue(issue.id)}
-                              assignees={issueAssigneesMap[issue.id] ?? []}
                               pullRequests={issueCardPullRequests}
                               relationships={resolveRelationshipsForIssue(
                                 issue.id,
@@ -1108,10 +1201,6 @@ export function KanbanContainer() {
                               onPriorityClick={(e) => {
                                 e.stopPropagation();
                                 handleCardPriorityClick(issue.id);
-                              }}
-                              onAssigneeClick={(e) => {
-                                e.stopPropagation();
-                                handleCardAssigneeClick(issue.id);
                               }}
                               onMoreActionsClick={() =>
                                 handleCardMoreActionsClick(issue.id)
@@ -1191,22 +1280,23 @@ export function KanbanContainer() {
         )
       ) : (
         <div className="flex-1 overflow-y-auto px-double">
-          <KanbanProvider onDragEnd={handleDragEnd} className="!block !w-full">
-            <IssueListView
-              statuses={listViewStatuses}
-              items={items}
-              issueMap={issueMap}
-              issueAssigneesMap={issueAssigneesMap}
-              getTagObjectsForIssue={getTagObjectsForIssue}
-              getResolvedRelationshipsForIssue={
-                getResolvedRelationshipsForIssue
-              }
-              onIssueClick={handleCardClick}
-              selectedIssueId={selectedKanbanIssueId}
-              selectedIssueIds={selectedIssueIds}
-              isMultiSelectActive={isMultiSelectActive}
-              onIssueCheckboxChange={handleCheckboxChange}
-            />
+          <KanbanProvider className="!block !w-full">
+            <DragDropContext onDragEnd={handleLegacyListDragEnd}>
+              <IssueListView
+                statuses={listViewStatuses}
+                items={items}
+                issueMap={issueMap}
+                getTagObjectsForIssue={getTagObjectsForIssue}
+                getResolvedRelationshipsForIssue={
+                  getResolvedRelationshipsForIssue
+                }
+                onIssueClick={handleCardClick}
+                selectedIssueId={selectedKanbanIssueId}
+                selectedIssueIds={selectedIssueIds}
+                isMultiSelectActive={isMultiSelectActive}
+                onIssueCheckboxChange={handleCheckboxChange}
+              />
+            </DragDropContext>
           </KanbanProvider>
         </div>
       )}

@@ -1,9 +1,4 @@
-import {
-  BuildingsIcon,
-  GearIcon,
-  SignOutIcon,
-  UserIcon,
-} from '@phosphor-icons/react';
+import { GearIcon, SignOutIcon, UserIcon } from '@phosphor-icons/react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../lib/cn';
 import {
@@ -15,16 +10,9 @@ import {
   DropdownMenuSeparator,
 } from './Dropdown';
 
-export interface AppBarUserOrganization {
-  id: string;
-  name: string;
-}
-
 interface AppBarUserPopoverProps {
   avatarUrl: string | null;
   avatarError: boolean;
-  organizations: AppBarUserOrganization[];
-  selectedOrgId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSettings?: () => void;
@@ -35,11 +23,11 @@ interface AppBarUserPopoverProps {
   onAvatarError: () => void;
 }
 
+// ADR-018 — the org switcher is gone. The popover now only exposes the
+// avatar + settings + optional logout items.
 export function AppBarUserPopover({
   avatarUrl,
   avatarError,
-  organizations,
-  selectedOrgId,
   open,
   onOpenChange,
   onSettings,
@@ -50,8 +38,6 @@ export function AppBarUserPopover({
   const settingsLabel = t('settings:settings.layout.nav.title', {
     defaultValue: 'Settings',
   });
-  const selectedOrg =
-    organizations.find((org) => org.id === selectedOrgId) ?? organizations[0];
 
   return (
     <DropdownMenu open={open} onOpenChange={onOpenChange}>
@@ -81,21 +67,12 @@ export function AppBarUserPopover({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent side="right" align="end" className="min-w-[200px]">
-        <DropdownMenuLabel>{t('orgSwitcher.organizations')}</DropdownMenuLabel>
+        <DropdownMenuLabel>{t('account')}</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {selectedOrg && (
-          <div className="px-3 py-2 text-sm text-fg-muted flex items-center gap-2">
-            <BuildingsIcon className="size-icon-xs" weight="bold" />
-            <span className="truncate">{selectedOrg.name}</span>
-          </div>
-        )}
         {onSettings && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem icon={GearIcon} onClick={onSettings}>
-              {settingsLabel}
-            </DropdownMenuItem>
-          </>
+          <DropdownMenuItem icon={GearIcon} onClick={onSettings}>
+            {settingsLabel}
+          </DropdownMenuItem>
         )}
         {onLogout && (
           <>

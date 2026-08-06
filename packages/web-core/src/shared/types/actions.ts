@@ -42,7 +42,14 @@ export interface ProjectMutations {
   removeIssue: (id: string) => void;
   duplicateIssue: (issueId: string) => void;
   getIssue: (issueId: string) => { simple_id: string } | undefined;
-  getAssigneesForIssue: (issueId: string) => { user_id: string }[];
+  /**
+   * Open the lightweight create-issue modal for the current project. Resolves
+   * with the newly-created issue id, or `null` if the user cancelled.
+   * Lives on `ProjectMutations` because it needs ProjectContext data (statuses,
+   * issues, insertIssue, etc.) — registered by `ProjectMutationsRegistration`
+   * which is mounted INSIDE `ProjectProvider`.
+   */
+  createIssue: (options?: ProjectIssueCreateOptions) => Promise<string | null>;
 }
 
 // Workspace type for sidebar (minimal subset needed for workspace selection)
@@ -73,11 +80,6 @@ export interface ActionExecutorContext {
     projectId: string,
     issueIds: string[]
   ) => Promise<void>;
-  openAssigneeSelection: (
-    projectId: string,
-    issueIds: string[],
-    isCreateMode?: boolean
-  ) => Promise<void>;
   openSubIssueSelection: (
     projectId: string,
     issueId: string,
@@ -90,16 +92,16 @@ export interface ActionExecutorContext {
     relationshipType: 'blocking' | 'related' | 'has_duplicate',
     direction: 'forward' | 'reverse'
   ) => Promise<void>;
-  // Kanban navigation (URL-based)
-  navigateToCreateIssue: (options?: ProjectIssueCreateOptions) => void;
+  // Kanban issue creation (delegates to ProjectMutations.createIssue when
+  // mounted inside ProjectProvider; no-op otherwise).
+  createIssue: (options?: ProjectIssueCreateOptions) => Promise<string | null>;
   // Default status for issue creation based on current kanban tab
   defaultCreateStatusId?: string;
   // Current kanban context (for project settings action)
-  kanbanOrgId?: string;
   kanbanProjectId?: string;
   // Project mutations (registered when inside ProjectProvider)
   projectMutations?: ProjectMutations;
-  // Remote workspaces (from Electric sync via UserContext)
+  // Remote workspaces (from Electric sync via WorkspacesContext)
   remoteWorkspaces: RemoteWorkspace[];
 }
 
@@ -146,9 +148,6 @@ export interface ActionVisibilityContext {
   hasSelectedKanbanIssue: boolean;
   hasSelectedKanbanIssueParent: boolean;
   isCreatingIssue: boolean;
-
-  // Auth state
-  isSignedIn: boolean;
 }
 
 // Enum discriminant for action target types

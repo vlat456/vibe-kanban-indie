@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use api_types::LoginStatus;
 use axum::{
     Json, Router,
     body::Body,
@@ -90,7 +89,6 @@ impl Environment {
 pub struct UserSystemInfo {
     pub version: String,
     pub config: Config,
-    pub login_status: LoginStatus,
     #[serde(flatten)]
     pub profiles: ExecutorConfigs,
     pub environment: Environment,
@@ -105,12 +103,10 @@ async fn get_user_system_info(
     State(deployment): State<DeploymentImpl>,
 ) -> ResponseJson<ApiResponse<UserSystemInfo>> {
     let config = deployment.config().read().await.clone();
-    let login_status = deployment.get_login_status().await;
 
     let user_system_info = UserSystemInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         config,
-        login_status,
         profiles: ExecutorConfigs::get_cached(),
         environment: Environment::new(),
         capabilities: {
@@ -147,9 +143,16 @@ async fn update_config(
 
     match save_config_to_file(&new_config, &config_path).await {
         Ok(_) => {
-            let mut config = deployment.config().write().await;
-            *config = new_config.clone();
-            drop(config);
+            {
+                let mut config = deployment.config().write().await;
+                *config = new_config.clone();
+            } // tokio write-lock released here
+
+            // Hot-reload the origin-check middleware cache with the new list.
+            // An empty list resets the cache to the VK_ALLOWED_ORIGINS env seed.
+            // Done AFTER the tokio config lock is released so the std RwLock
+            // write never blocks an async worker thread while holding it.
+            crate::middleware::origin::set_allowed_origins(&new_config.allowed_origins);
 
             // Track config events when fields transition from false → true and run side effects
 

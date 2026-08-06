@@ -1,43 +1,264 @@
-import { useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import {
+  PROJECT_WORKSPACES_SHAPE,
+  type IssuePriority,
+  type Project,
+} from 'shared/remote-types';
 import { Group, Layout, Panel, Separator } from 'react-resizable-panels';
-import { OrgProvider } from '@/shared/providers/remote/OrgProvider';
-import { useOrgContext } from '@/shared/hooks/useOrgContext';
+import { useProjects } from '@/shared/hooks/useProjects';
+import { useProjectsContext } from '@/shared/providers/ProjectProvider';
 import { ProjectProvider } from '@/shared/providers/remote/ProjectProvider';
 import { useProjectContext } from '@/shared/hooks/useProjectContext';
 import { useActions } from '@/shared/hooks/useActions';
 import { usePageTitle } from '@/shared/hooks/usePageTitle';
 import { KanbanContainer } from '@/features/kanban/ui/KanbanContainer';
 import { useIsMobile } from '@/shared/hooks/useIsMobile';
+import { useHostId } from '@/shared/providers/HostIdProvider';
 import { ProjectRightSidebarContainer } from './ProjectRightSidebarContainer';
 import {
   PERSIST_KEYS,
   usePaneSize,
 } from '@/shared/stores/useUiPreferencesStore';
-import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
-import { useOrganizationProjects } from '@/shared/hooks/useOrganizationProjects';
-import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
-import { useAuth } from '@/shared/hooks/auth/useAuth';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { useCurrentKanbanRouteState } from '@/shared/hooks/useCurrentKanbanRouteState';
+import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
+import { useWorkspacesContext } from '@/shared/hooks/useWorkspacesContext';
+import { useProjectWorkspaceCreateDraft } from '@/shared/hooks/useProjectWorkspaceCreateDraft';
+import { workspacesApi } from '@/shared/lib/api';
+import { getWorkspaceDefaults } from '@/shared/lib/workspaceDefaults';
+import {
+  buildLinkedIssueCreateState,
+  buildLocalWorkspaceIdSet,
+  buildWorkspaceCreateInitialState,
+  buildWorkspaceCreatePrompt,
+} from '@/shared/lib/workspaceCreateState';
+import {
+  getLinkWorkspaceErrorMessage,
+  WORKSPACE_ALREADY_LINKED_MESSAGE,
+} from '@/shared/lib/workspaces';
+import { refreshShapeSource } from '@/shared/lib/electric/collections';
+import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import {
   buildKanbanIssueComposerKey,
   closeKanbanIssueComposer,
+  type ProjectIssueCreateOptions,
 } from '@/shared/stores/useKanbanIssueComposerStore';
+import {
+  CreateIssueDialog,
+  type CreateIssueDialogPriorityOption,
+  type CreateIssueDialogStatusOption,
+} from '@/shared/dialogs/kanban/CreateIssueDialog';
+
+const PRIORITY_ORDER: IssuePriority[] = ['urgent', 'high', 'medium', 'low'];
 /**
  * Component that registers project mutations with ActionsContext.
  * Must be rendered inside both ActionsProvider and ProjectProvider.
  */
 function ProjectMutationsRegistration({ children }: { children: ReactNode }) {
   const { registerProjectMutations } = useActions();
-  const { removeIssue, insertIssue, getIssue, getAssigneesForIssue, issues } =
-    useProjectContext();
+  const { t } = useTranslation('common');
+  const appNavigation = useAppNavigation();
+  const hostId = useHostId();
+  const { activeWorkspaces, archivedWorkspaces } = useWorkspaceContext();
+  const { workspaces: remoteWorkspaces } = useWorkspacesContext();
+  const { openWorkspaceCreateFromState } = useProjectWorkspaceCreateDraft();
+  const {
+    projectId,
+    statuses,
+    issues,
+    issuesById,
+    getIssue,
+    insertIssue,
+    removeIssue,
+  } = useProjectContext();
 
   // Use ref to always access latest issues (avoid stale closure)
   const issuesRef = useRef(issues);
   useEffect(() => {
     issuesRef.current = issues;
   }, [issues]);
+
+  const statusOptions: CreateIssueDialogStatusOption[] = useMemo(
+    () =>
+      [...statuses]
+        .sort((a, b) => a.sort_order - b.sort_order)
+        .map((status) => ({ id: status.id, name: status.name })),
+    [statuses]
+  );
+
+  const priorityOptions: CreateIssueDialogPriorityOption[] = useMemo(
+    () =>
+      PRIORITY_ORDER.map((value) => ({
+        value,
+        label: t(`createIssueDialog.priority.${value}`),
+      })),
+    [t]
+  );
+
+  const workspaceOptions = useMemo(() => {
+    const active = activeWorkspaces.map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      branch: workspace.branch,
+      isArchived: false,
+    }));
+    const archived = archivedWorkspaces.map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      branch: workspace.branch,
+      isArchived: true,
+    }));
+    return [...active, ...archived];
+  }, [activeWorkspaces, archivedWorkspaces]);
+
+  const openCreateIssue = useCallback(
+    async (options?: ProjectIssueCreateOptions): Promise<string | null> => {
+      const defaultStatusId = options?.statusId ?? statusOptions[0]?.id ?? '';
+
+      // Resolve parent issue's simple_id for the dialog hint.
+      const parentIssueSimpleId = options?.parentIssueId
+        ? (issuesById.get(options.parentIssueId)?.simple_id ??
+          getIssue(options.parentIssueId)?.simple_id ??
+          null)
+        : null;
+
+      // Close any open composer for this project so the right sidebar doesn't
+      // collide with the modal. We close BEFORE awaiting creation so the
+      // modal flow is unblocked by the existing sidebar.
+      const composerKey = buildKanbanIssueComposerKey(hostId, projectId);
+      closeKanbanIssueComposer(composerKey);
+
+      const res = await CreateIssueDialog.show({
+        statuses: statusOptions,
+        defaultStatusId,
+        priorities: priorityOptions,
+        workspaces: workspaceOptions,
+        parentIssueSimpleId,
+        onCreate: async ({
+          title,
+          description,
+          statusId,
+          priority,
+        }): Promise<string> => {
+          // Top-of-column sort_order: min sort_order of issues in the target
+          // status, minus 1 (so the new card lands at the top). Fall back to
+          // 0 when the column is empty.
+          const statusIssues = issuesRef.current.filter(
+            (issue) => issue.status_id === statusId
+          );
+          const minSortOrder =
+            statusIssues.length > 0
+              ? Math.min(...statusIssues.map((issue) => issue.sort_order))
+              : 0;
+
+          const { persisted } = insertIssue({
+            project_id: projectId,
+            status_id: statusId,
+            title,
+            description,
+            priority,
+            sort_order: minSortOrder - 1,
+            start_date: null,
+            target_date: null,
+            completed_at: null,
+            parent_issue_id: options?.parentIssueId ?? null,
+            parent_issue_sort_order: null,
+            extension_metadata: {},
+          });
+
+          const syncedIssue = await persisted;
+
+          return syncedIssue.id;
+        },
+      });
+
+      if (res.action === 'created') {
+        if (res.workspace.kind === 'none') {
+          appNavigation.goToProjectIssue(projectId, res.issueId);
+          return res.issueId;
+        }
+
+        if (res.workspace.kind === 'existing') {
+          appNavigation.goToProjectIssue(projectId, res.issueId);
+          void workspacesApi
+            .linkToIssue(res.workspace.id, projectId, res.issueId)
+            .then(() => {
+              refreshShapeSource(PROJECT_WORKSPACES_SHAPE, {
+                project_id: projectId,
+              });
+            })
+            .catch((error: unknown) => {
+              const errorMessage =
+                getLinkWorkspaceErrorMessage(error) ??
+                t('workspaces.linkError', 'Failed to link workspace');
+
+              if (errorMessage !== WORKSPACE_ALREADY_LINKED_MESSAGE) {
+                console.error('Failed to link workspace to issue:', error);
+              }
+
+              void ConfirmDialog.show({
+                title: t('common:error'),
+                message: errorMessage,
+                confirmText: t('common:ok'),
+                showCancelButton: false,
+              });
+            });
+          return res.issueId;
+        }
+
+        const issue = getIssue(res.issueId);
+        const prompt = buildWorkspaceCreatePrompt(
+          issue?.title ?? null,
+          issue?.description ?? null
+        );
+        const defaults = await getWorkspaceDefaults(
+          remoteWorkspaces,
+          buildLocalWorkspaceIdSet(activeWorkspaces, archivedWorkspaces),
+          projectId
+        );
+        const createState = buildWorkspaceCreateInitialState({
+          prompt,
+          defaults,
+          linkedIssue: buildLinkedIssueCreateState(issue, projectId),
+        });
+        const draftId = await openWorkspaceCreateFromState(createState, {
+          issueId: res.issueId,
+        });
+
+        if (!draftId) {
+          appNavigation.goToProjectIssue(projectId, res.issueId);
+          await ConfirmDialog.show({
+            title: t('common:error'),
+            message: t(
+              'workspaces.createDraftError',
+              'Failed to prepare workspace draft. Please try again.'
+            ),
+            confirmText: t('common:ok'),
+            showCancelButton: false,
+          });
+        }
+        return res.issueId;
+      }
+      return null;
+    },
+    [
+      statusOptions,
+      priorityOptions,
+      workspaceOptions,
+      issuesById,
+      getIssue,
+      insertIssue,
+      appNavigation,
+      hostId,
+      projectId,
+      remoteWorkspaces,
+      activeWorkspaces,
+      archivedWorkspaces,
+      openWorkspaceCreateFromState,
+      t,
+    ]
+  );
 
   useEffect(() => {
     registerProjectMutations({
@@ -74,7 +295,7 @@ function ProjectMutationsRegistration({ children }: { children: ReactNode }) {
         });
       },
       getIssue,
-      getAssigneesForIssue,
+      createIssue: openCreateIssue,
     });
 
     return () => {
@@ -85,7 +306,7 @@ function ProjectMutationsRegistration({ children }: { children: ReactNode }) {
     removeIssue,
     insertIssue,
     getIssue,
-    getAssigneesForIssue,
+    openCreateIssue,
   ]);
 
   return <>{children}</>;
@@ -177,11 +398,12 @@ function ProjectKanbanLayout({ projectName }: { projectName: string }) {
 }
 
 /**
- * Inner component that renders the Kanban board once we have the org context
+ * Inner component that renders the Kanban board once we have the project list
+ * from the flat projects layer (ADR-018).
  */
 function ProjectKanbanInner({ projectId }: { projectId: string }) {
   const { t } = useTranslation('common');
-  const { projects, isLoading } = useOrgContext();
+  const { projects, isLoading } = useProjectsContext();
 
   const project = projects.find((p) => p.id === projectId);
 
@@ -211,34 +433,6 @@ function ProjectKanbanInner({ projectId }: { projectId: string }) {
 }
 
 /**
- * Hook to find a project by ID, using orgId from Zustand store
- */
-function useFindProjectById(projectId: string | undefined) {
-  const { isLoaded: authLoaded } = useAuth();
-  const { data: orgsData, isLoading: orgsLoading } = useUserOrganizations();
-  const selectedOrgId = useOrganizationStore((s) => s.selectedOrgId);
-  const organizations = orgsData?.organizations ?? [];
-
-  // Use stored org ID, or fall back to first org
-  const orgIdToUse = selectedOrgId ?? organizations[0]?.id ?? null;
-
-  const { data: projects = [], isLoading: projectsLoading } =
-    useOrganizationProjects(orgIdToUse);
-
-  const project = useMemo(() => {
-    if (!projectId) return undefined;
-    return projects.find((p) => p.id === projectId);
-  }, [projectId, projects]);
-
-  return {
-    project,
-    organizationId: project?.organization_id ?? selectedOrgId,
-    // Include auth loading state - we can't determine project access until auth loads
-    isLoading: !authLoaded || orgsLoading || projectsLoading,
-  };
-}
-
-/**
  * ProjectKanban page - displays the Kanban board for a specific project
  *
  * URL patterns:
@@ -250,14 +444,14 @@ function useFindProjectById(projectId: string | undefined) {
  * Note: issue creation is composer-store state on top of /projects/:projectId.
  *
  * Note: This component is rendered inside SharedAppLayout which provides
- * NavbarContainer, AppBar, and SyncErrorProvider.
+ * NavbarContainer, AppBar, SyncErrorProvider, and ProjectProvider
+ * (the flat projects layer — ADR-018).
  */
 export function ProjectKanban() {
   const { projectId, hostId, hasInvalidWorkspaceCreateDraftId } =
     useCurrentKanbanRouteState();
   const appNavigation = useAppNavigation();
   const { t } = useTranslation('common');
-  const { isSignedIn, isLoaded: authLoaded } = useAuth();
   const issueComposerKey = useMemo(() => {
     if (!projectId) {
       return null;
@@ -286,30 +480,7 @@ export function ProjectKanban() {
     }
   }, [projectId, hasInvalidWorkspaceCreateDraftId, appNavigation]);
 
-  // Find the project and get its organization
-  const { organizationId, isLoading } = useFindProjectById(
-    projectId ?? undefined
-  );
-
-  // Show loading while auth state is being determined
-  if (!authLoaded || isLoading) {
-    return (
-      <div className="flex items-center justify-center h-full w-full">
-        <p className="text-low">{t('states.loading')}</p>
-      </div>
-    );
-  }
-
-  // If not signed in, prompt user to log in
-  if (!isSignedIn) {
-    return (
-      <div className="flex items-center justify-center h-full w-full p-base">
-        <p className="text-low">{t('kanban.loginRequired.description')}</p>
-      </div>
-    );
-  }
-
-  if (!projectId || !organizationId) {
+  if (!projectId) {
     return (
       <div className="flex items-center justify-center h-full w-full">
         <p className="text-low">{t('kanban.noProjectFound')}</p>
@@ -317,9 +488,18 @@ export function ProjectKanban() {
     );
   }
 
-  return (
-    <OrgProvider organizationId={organizationId}>
-      <ProjectKanbanInner projectId={projectId} />
-    </OrgProvider>
-  );
+  // ProjectProvider (the flat projects layer) is already mounted by
+  // SharedAppLayout — we look up the project directly via the same hook.
+  const { data: projects } = useProjects();
+  const project = projects.find((p: Project) => p.id === projectId);
+
+  if (!project) {
+    return (
+      <div className="flex items-center justify-center h-full w-full">
+        <p className="text-low">{t('kanban.noProjectFound')}</p>
+      </div>
+    );
+  }
+
+  return <ProjectKanbanInner projectId={projectId} />;
 }

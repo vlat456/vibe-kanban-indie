@@ -77,14 +77,6 @@ async fn main() -> Result<(), VibeKanbanError> {
         .await
         .map_err(DeploymentError::from)?;
 
-    // Ensure the predefined local user exists. Project/repo config lives in the
-    // DB (source of truth); TOML is only an explicit export/import format now.
-    if let Err(e) =
-        services::services::project_config::ensure_local_user(&deployment.db().pool).await
-    {
-        tracing::warn!("ensure local user failed: {e}");
-    }
-
     // CLI subcommands for the static config: `export [path]` / `import [path]`.
     // These run against the DB and exit without starting the HTTP server. An
     // unknown first arg falls through to normal server startup.
@@ -177,6 +169,12 @@ async fn main() -> Result<(), VibeKanbanError> {
         .expect("client preview proxy port already set");
 
     let app_router = routes::router(deployment.clone());
+
+    // Seed the origin-check middleware with the saved config's allowed origins
+    // (env var VK_ALLOWED_ORIGINS is the fallback when the config list is empty).
+    server::middleware::origin::set_allowed_origins(
+        &deployment.config().read().await.allowed_origins,
+    );
 
     // Production only: open browser, unless suppressed (e.g. when embedded by a
     // native host like the macOS app, which provides its own UI).

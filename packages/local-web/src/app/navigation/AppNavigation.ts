@@ -40,6 +40,8 @@ function resolveLocalDestinationFromPath(path: string): AppDestination | null {
       return { kind: 'onboarding' };
     case '/_app/workspaces':
       return { kind: 'workspaces' };
+    case '/_app/chat':
+      return { kind: 'chat' };
     case '/_app/common-tasks':
       return { kind: 'common-tasks' };
     case '/_app/hosts/$hostId/workspaces': {
@@ -77,6 +79,16 @@ function resolveLocalDestinationFromPath(path: string): AppDestination | null {
     case '/_app/projects/$projectId': {
       const projectId = getPathParam(routeParams, 'projectId');
       return projectId ? { kind: 'project', projectId } : null;
+    }
+    case '/_app/projects/$projectId_/orchestrator-prompt': {
+      // ADR-016: full-pane editor for the per-project orchestrator
+      // prompt. The `_:orchestrator-prompt` suffix uses the same
+      // path-non-collision convention as `_/issues/$issueId` so the
+      // bare `/projects/{id}` route still matches.
+      const projectId = getPathParam(routeParams, 'projectId');
+      return projectId
+        ? { kind: 'project-orchestrator-prompt', projectId }
+        : null;
     }
     case '/_app/projects/$projectId_/issues/$issueId': {
       const projectId = getPathParam(routeParams, 'projectId');
@@ -183,6 +195,8 @@ function destinationToLocalTarget(
       return { to: '/' } as const;
     case 'onboarding':
       return { to: '/onboarding' } as const;
+    case 'chat':
+      return { to: '/chat' } as const;
     case 'workspaces':
       if (effectiveHostId) {
         return {
@@ -300,6 +314,11 @@ function destinationToLocalTarget(
           draftId: destination.draftId,
         },
       } as const;
+    case 'project-orchestrator-prompt':
+      return {
+        to: '/projects/$projectId/orchestrator-prompt',
+        params: { projectId: destination.projectId },
+      } as const;
   }
 }
 
@@ -328,6 +347,7 @@ export function createLocalAppNavigation(): AppNavigation {
       navigateTo({ kind: 'onboarding' }, transition),
     goToWorkspaces: (transition) =>
       navigateTo({ kind: 'workspaces' }, transition),
+    goToChat: (transition) => navigateTo({ kind: 'chat' }, transition),
     goToWorkspacesCreate: (transition) =>
       navigateTo({ kind: 'workspaces-create' }, transition),
     goToWorkspace: (workspaceId, transition) =>
@@ -358,6 +378,11 @@ export function createLocalAppNavigation(): AppNavigation {
     goToProjectWorkspaceCreate: (projectId, draftId, transition) =>
       navigateTo(
         { kind: 'project-workspace-create', projectId, draftId },
+        transition
+      ),
+    goToProjectOrchestratorPrompt: (projectId, transition) =>
+      navigateTo(
+        { kind: 'project-orchestrator-prompt', projectId },
         transition
       ),
   };

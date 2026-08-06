@@ -8,14 +8,9 @@ import {
 import { useParams } from '@tanstack/react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import type { Workspace } from 'shared/types';
-import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
 import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import { useHostId } from '@/shared/providers/HostIdProvider';
-import {
-  buildKanbanIssueComposerKey,
-  openKanbanIssueComposer,
-  type ProjectIssueCreateOptions,
-} from '@/shared/stores/useKanbanIssueComposerStore';
+import { type ProjectIssueCreateOptions } from '@/shared/stores/useKanbanIssueComposerStore';
 import {
   type ActionDefinition,
   type ActionExecutorContext,
@@ -26,7 +21,7 @@ import {
   getActionLabel,
 } from '@/shared/types/actions';
 import { useWorkspaceContext } from '@/shared/hooks/useWorkspaceContext';
-import { UserContext } from '@/shared/hooks/useUserContext';
+import { WorkspacesContext } from '@/shared/hooks/useWorkspacesContext';
 import { ProjectContext } from '@/shared/hooks/useProjectContext';
 import { useDevServer } from '@/shared/hooks/useDevServer';
 import { useLogsPanel } from '@/shared/hooks/useLogsPanel';
@@ -45,13 +40,11 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
   const { projectId } = useParams({ strict: false });
   const hostId = useHostId();
   const queryClient = useQueryClient();
-  // Get selected organization ID from store (for kanban context)
-  const selectedOrgId = useOrganizationStore((s) => s.selectedOrgId);
   // Get workspace context (ActionsProvider is nested inside WorkspaceProvider)
   const { selectWorkspace, activeWorkspaces, workspaceId, workspace } =
     useWorkspaceContext();
   // Get remote workspaces (optional — not available on all routes)
-  const userCtx = useContext(UserContext);
+  const workspacesCtx = useContext(WorkspacesContext);
   const projectCtx = useContext(ProjectContext);
   // Get dev server state
   const { start, stop, runningDevServers } = useDevServer(workspaceId);
@@ -72,19 +65,15 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
     []
   );
 
-  // Navigate to create issue mode (URL-based navigation)
-  const navigateToCreateIssue = useCallback(
-    (options?: ProjectIssueCreateOptions) => {
-      if (!projectId) {
-        return;
-      }
-
-      openKanbanIssueComposer(
-        buildKanbanIssueComposerKey(hostId, projectId),
-        options
-      );
-    },
-    [projectId, hostId]
+  // Open the lightweight Create Issue modal. Delegates to the bridge
+  // component (ProjectMutationsRegistration) that lives INSIDE
+  // ProjectProvider. When no project context is registered, this is a no-op
+  // returning null. Imperative call from action executors / event handlers —
+  // never from useEffect.
+  const createIssue = useCallback(
+    (options?: ProjectIssueCreateOptions) =>
+      projectMutations?.createIssue?.(options) ?? Promise.resolve(null),
+    [projectMutations]
   );
 
   // Get logs panel state
@@ -130,17 +119,6 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
         projectId,
         selection: { type: 'priority', issueIds },
       });
-    },
-    []
-  );
-
-  // Open assignee selection dialog (uses dynamic import to avoid circular deps)
-  const openAssigneeSelection = useCallback(
-    async (projectId: string, issueIds: string[], isCreateMode = false) => {
-      const { AssigneeSelectionDialog } = await import(
-        '@/shared/dialogs/kanban/AssigneeSelectionDialog'
-      );
-      await AssigneeSelectionDialog.show({ projectId, issueIds, isCreateMode });
     },
     []
   );
@@ -216,17 +194,15 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
       logsPanelContent,
       openStatusSelection,
       openPrioritySelection,
-      openAssigneeSelection,
       openSubIssueSelection,
       openWorkspaceSelection,
       openRelationshipSelection,
-      navigateToCreateIssue,
+      createIssue,
       defaultCreateStatusId,
-      kanbanOrgId: selectedOrgId ?? undefined,
       kanbanProjectId: projectId,
       projectMutations: projectMutations ?? undefined,
       remoteWorkspaces: (() => {
-        const userWs = userCtx?.workspaces ?? [];
+        const userWs = workspacesCtx?.workspaces ?? [];
         const projectWs = projectCtx?.workspaces ?? [];
         if (projectWs.length === 0) return userWs;
         if (userWs.length === 0) return projectWs;
@@ -249,16 +225,14 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
     logsPanelContent,
     openStatusSelection,
     openPrioritySelection,
-    openAssigneeSelection,
     openSubIssueSelection,
     openWorkspaceSelection,
     openRelationshipSelection,
-    navigateToCreateIssue,
+    createIssue,
     defaultCreateStatusId,
-    selectedOrgId,
     projectId,
     projectMutations,
-    userCtx?.workspaces,
+    workspacesCtx?.workspaces,
     projectCtx?.workspaces,
   ]);
 
@@ -342,10 +316,10 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
       getLabel,
       openStatusSelection,
       openPrioritySelection,
-      openAssigneeSelection,
       openSubIssueSelection,
       openWorkspaceSelection,
       openRelationshipSelection,
+      createIssue,
       setDefaultCreateStatusId,
       registerProjectMutations,
       executorContext,
@@ -355,10 +329,10 @@ export function ActionsProvider({ children }: ActionsProviderProps) {
       getLabel,
       openStatusSelection,
       openPrioritySelection,
-      openAssigneeSelection,
       openSubIssueSelection,
       openWorkspaceSelection,
       openRelationshipSelection,
+      createIssue,
       registerProjectMutations,
       executorContext,
     ]
